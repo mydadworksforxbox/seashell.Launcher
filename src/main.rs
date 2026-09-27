@@ -479,6 +479,9 @@ async fn run() -> LauncherResult<()> {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(target_os = "windows")]
+    let _ = colored::control::set_virtual_terminal(true);
+
     // The launcher usually runs in a console window opened by the browser, which closes as soon
     // as the process ends. Keep it open after a failure so the player can read what went wrong.
     let default_panic_hook = std::panic::take_hook();
