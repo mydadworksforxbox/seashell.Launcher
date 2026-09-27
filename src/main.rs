@@ -1,17 +1,41 @@
 use colored::*;
 use futures_util::StreamExt;
 use reqwest::Client;
-use sha1::{Digest, Sha1};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+mod client_manifest;
+#[cfg(target_os = "windows")]
+mod client_patch;
+mod launcher_update;
 
 #[cfg(target_os = "windows")]
 use winreg::enums::*;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+#[cfg(target_os = "windows")]
+fn open_games_page(url: &str) -> LauncherResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide_url: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(Some(0)).collect();
+    let open: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(0, open.as_ptr(), wide_url.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+    };
+    if result as isize <= 32 {
+        return Err(format!("could not open {} (Windows ShellExecute error {})", url, result as isize));
+    }
+    Ok(())
+}
 
 type LauncherResult<T> = Result<T, String>;
+const MAX_CLIENT_ZIP_BYTES: u64 = 2_000_000_000;
+const MAX_EXTRACTED_BYTES: u64 = 4_000_000_000;
 
 fn info( message : &str ) {
     let time = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -32,16 +56,6 @@ fn debug( message : &str ) {
 #[cfg(not(debug_assertions))]
 fn debug( _message : &str ) {}
 
-async fn http_get( client: &Client, url: &str ) -> LauncherResult<String> {
-    debug(&format!("{} {}", "GET".green(), url.bright_blue()));
-    let response = client.get(url).send().await.map_err(|e| format!("could not reach {}: {}", url, e))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{} answered HTTP {}", url, status));
-    }
-    response.text().await.map_err(|e| format!("could not read the response from {}: {}", url, e))
-}
-
 async fn download_file( client: &Client, url: &str, path: &Path ) -> LauncherResult<()> {
     debug(&format!("{} {}", "GET".green(), url.bright_blue()));
     let response = client.get(url).send().await.map_err(|e| format!("could not reach {}: {}", url, e))?;
@@ -50,6 +64,9 @@ async fn download_file( client: &Client, url: &str, path: &Path ) -> LauncherRes
         return Err(format!("downloading {} failed with HTTP {}", url, status));
     }
     let expected_length = response.content_length();
+    if expected_length.is_some_and(|length| length > MAX_CLIENT_ZIP_BYTES) {
+        return Err(format!("{} is larger than the client download limit", url));
+    }
     debug(&format!("Content Length: {:?}", expected_length));
 
     info(&format!("Downloading {}", url.bright_blue()));
@@ -82,6 +99,11 @@ async fn download_file( client: &Client, url: &str, path: &Path ) -> LauncherRes
         let chunk = chunk.map_err(|e| format!("the download of {} was interrupted: {}", url, e))?;
         writer.write_all(&chunk).map_err(|e| format!("could not write {}: {}", partial_path.display(), e))?;
         downloaded += chunk.len() as u64;
+        if downloaded > MAX_CLIENT_ZIP_BYTES {
+            drop(writer);
+            let _ = std::fs::remove_file(&partial_path);
+            return Err(format!("{} exceeded the client download limit", url));
+        }
         progress_bar.set_position(downloaded);
     }
     writer.flush().map_err(|e| format!("could not write {}: {}", partial_path.display(), e))?;
@@ -104,12 +126,6 @@ async fn download_file( client: &Client, url: &str, path: &Path ) -> LauncherRes
     Ok(())
 }
 
-async fn download_file_prefix( client: &Client, url: &str, path_prefix : &Path ) -> LauncherResult<PathBuf> {
-    let path = path_prefix.join(format!("{:x}", md5::compute(url.as_bytes())));
-    download_file_verified(client, url, &path).await?;
-    Ok(path)
-}
-
 fn create_folder_if_not_exists( path: &Path ) -> LauncherResult<()> {
     if !path.exists() {
         info(&format!("Creating folder {}", path.display().to_string().bright_blue()));
@@ -118,66 +134,11 @@ fn create_folder_if_not_exists( path: &Path ) -> LauncherResult<()> {
     Ok(())
 }
 
-fn get_sha1_hash_of_file( path: &Path ) -> LauncherResult<String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("could not open {}: {}", path.display(), e))?;
-    let mut hasher = Sha1::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("could not read {}: {}", path.display(), e))?;
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 fn get_sha256_hash_of_file( path: &Path ) -> LauncherResult<String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("could not open {}: {}", path.display(), e))?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).map_err(|e| format!("could not read {}: {}", path.display(), e))?;
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-// Integrity verification is optional and backwards compatible: if the setup server does not
-// publish a "<file>.sha256" sidecar (404), older deployments keep working unverified. Any other
-// failure (bad status, malformed digest) is treated as an error rather than silently skipped, so
-// a misconfigured sidecar doesn't quietly disable verification.
-async fn fetch_expected_sha256( client: &Client, file_url: &str ) -> LauncherResult<Option<String>> {
-    let hash_url = format!("{}.sha256", file_url);
-    debug(&format!("{} {}", "GET".green(), hash_url.bright_blue()));
-    let response = client.get(&hash_url).send().await.map_err(|e| format!("could not reach {}: {}", hash_url, e))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        return Err(format!("{} answered HTTP {}", hash_url, response.status()));
-    }
-    let body = response.text().await.map_err(|e| format!("could not read {}: {}", hash_url, e))?;
-    let digest = body.trim().to_ascii_lowercase();
-    let looks_like_sha256 = digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit());
-    if !looks_like_sha256 {
-        return Err(format!("{} did not contain a SHA-256 hex digest", hash_url));
-    }
-    Ok(Some(digest))
-}
-
-// Downloads `url` to `path` via `download_file`, then verifies it against an optional
-// "<url>.sha256" sidecar. See `fetch_expected_sha256` for the backwards-compatibility behavior
-// when the sidecar is missing.
-async fn download_file_verified( client: &Client, url: &str, path: &Path ) -> LauncherResult<()> {
-    download_file(client, url, path).await?;
-    match fetch_expected_sha256(client, url).await? {
-        Some(expected_hash) => {
-            let actual_hash = get_sha256_hash_of_file(path)?;
-            if actual_hash.eq_ignore_ascii_case(&expected_hash) {
-                info(&format!("Verified SHA-256 checksum of {}", path.display().to_string().bright_blue()));
-            } else {
-                let _ = std::fs::remove_file(path);
-                return Err(format!(
-                    "checksum mismatch for {} (expected {}, got {}); the download may be corrupted or tampered with",
-                    url, expected_hash, actual_hash
-                ));
-            }
-        },
-        None => {
-            debug(&format!("No {}.sha256 published; proceeding without integrity verification", url));
-        }
-    }
-    Ok(())
 }
 
 fn get_installation_directory() -> LauncherResult<PathBuf> {
@@ -236,37 +197,19 @@ fn print_banner( base_url: &str ) {
     println!("\n{}{}\n", padding, banner.magenta().cyan().italic().on_black());
 }
 
-async fn fetch_latest_version( client: &Client, setup_url: &str ) -> LauncherResult<String> {
-    let url = format!("https://{}/version", setup_url);
-    let mut last_error = String::new();
-    for attempt in 1..=3 {
-        match http_get(client, &url).await {
-            Ok(body) => {
-                let version = body.trim().to_string();
-                if is_valid_version(&version) {
-                    return Ok(version);
-                }
-                return Err(format!("the setup server sent something that is not a client version ({} characters). Is {} reaching the Seashell website?", version.len(), setup_url));
-            },
-            Err(e) => {
-                last_error = e;
-                if attempt < 3 {
-                    error(&format!("Could not fetch the latest client version (attempt {} of 3): {}", attempt, last_error));
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            }
-        }
-    }
-    Err(format!("could not fetch the latest client version: {}. Are you connected to the internet?", last_error))
-}
-
 // Windows PowerShell's Compress-Archive writes "\" separators, including on folder entries, and
 // zip readers that only recognise "/" turn those folders into empty files. Accept both.
 fn extract_zip( zip_path: &Path, target_directory: &Path ) -> LauncherResult<()> {
     let zip_file = std::fs::File::open(zip_path).map_err(|e| format!("could not open {}: {}", zip_path.display(), e))?;
     let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("the client download is not a valid zip: {}", e))?;
+    let mut extracted_bytes = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|e| format!("could not read the client zip: {}", e))?;
+        extracted_bytes = extracted_bytes.checked_add(entry.size())
+            .ok_or_else(|| "the client zip is too large".to_string())?;
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err("the client zip exceeds the extraction size limit".to_string());
+        }
         let name = entry.name().replace('\\', "/");
         let mut relative_path = PathBuf::new();
         for part in name.split('/') {
@@ -294,75 +237,9 @@ fn extract_zip( zip_path: &Path, target_directory: &Path ) -> LauncherResult<()>
     Ok(())
 }
 
-fn remove_other_versions( versions_directory: &Path, current_version_directory: &Path ) {
-    let Ok(entries) = std::fs::read_dir(versions_directory) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path != current_version_directory {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                info(&format!("Could not remove the old client folder {} ({}); it will be removed after the next update.", path.display(), e));
-            }
-        }
-    }
-}
-
-async fn install_client(
-    client: &Client,
-    setup_url: &str,
-    base_url: &str,
-    version: &str,
-    versions_directory: &Path,
-    current_version_directory: &Path,
-    latest_bootstrapper_path: &Path,
-    temp_downloads_directory: &Path,
-) -> LauncherResult<()> {
-    info("Downloading the latest client files, this may take a while.");
-    // Start from a clean folder, keeping only the launcher itself.
-    let entries = std::fs::read_dir(current_version_directory).map_err(|e| format!("could not open {}: {}", current_version_directory.display(), e))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let result = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else if path != latest_bootstrapper_path {
-            std::fs::remove_file(&path)
-        } else {
-            Ok(())
-        };
-        result.map_err(|e| format!("could not clean up {}: {}. Close Seashell if it is running and try again.", path.display(), e))?;
-    }
-
-    create_folder_if_not_exists(temp_downloads_directory)?;
-    let zip_url = format!("https://{}/{}-2016client.zip", setup_url, version);
-    let zip_path = download_file_prefix(client, &zip_url, temp_downloads_directory).await?;
-
-    let client_directory = current_version_directory.join("Client2016");
-    create_folder_if_not_exists(&client_directory)?;
-    info(&format!("Extracting {} to {}", zip_path.display().to_string().bright_blue(), client_directory.display().to_string().bright_blue()));
-    extract_zip(&zip_path, &client_directory)?;
-    if !client_directory.join("RobloxPlayerBeta.exe").exists() {
-        return Err("the downloaded client does not contain RobloxPlayerBeta.exe".to_string());
-    }
-    info("Finished extracting files, cleaning up.");
-    let _ = std::fs::remove_dir_all(temp_downloads_directory);
-
-    // AppSettings.xml marks the install as complete, so it is written last.
-    let app_settings_xml = format!(
-"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<Settings>
-	<ContentFolder>content</ContentFolder>
-	<BaseUrl>https://{}</BaseUrl>
-</Settings>", base_url
-    );
-    let app_settings_path = current_version_directory.join("AppSettings.xml");
-    std::fs::write(&app_settings_path, app_settings_xml).map_err(|e| format!("could not write {}: {}", app_settings_path.display(), e))?;
-
-    remove_other_versions(versions_directory, current_version_directory);
-    Ok(())
-}
-
 // Field names used by the seashell-player/syntax-player launch URI, e.g.
 // "1+launchmode:play+gameinfo:TICKET+placelauncherurl:https://.../placelauncher.ashx?placeId=660&t=TICKET+k:l+clientyear:2016".
-const LAUNCH_URI_KNOWN_KEYS: [&str; 6] = ["launchmode", "gameinfo", "placelauncherurl", "browsertrackerid", "k", "clientyear"];
+const LAUNCH_URI_KNOWN_KEYS: [&str; 7] = ["launchmode", "gameinfo", "placelauncherurl", "browsertrackerid", "k", "clientyear", "clientversion"];
 
 // Splits the argument portion of a launch URI (everything after the scheme) into key/value
 // pairs. A naive `split('+')` corrupts any field whose value itself contains a literal '+'
@@ -403,117 +280,131 @@ fn parse_launch_arguments( raw: &str ) -> Vec<(String, String)> {
     pairs
 }
 
+struct LaunchRequest {
+    client_version: String,
+    authentication_ticket: String,
+    join_script: String,
+}
+
+fn version_from_legacy_year(year: &str) -> Option<&'static str> {
+    match year {
+        "2016" => Some("2016"),
+        "2017" => Some("2017L"),
+        "2018" => Some("2018L"),
+        "2020" => Some("2020L"),
+        "2021" => Some("2021M"),
+        _ => None,
+    }
+}
+
+fn parse_launch_request(uri: &str, base_url: &str) -> LauncherResult<LaunchRequest> {
+    let payload = ["seashell-player://", "seashell-player:", "syntax-player://", "syntax-player:"]
+        .iter()
+        .find_map(|prefix| uri.strip_prefix(prefix))
+        .ok_or_else(|| "this is not a Seashell Play link".to_string())?;
+    let mut launch_mode = String::new();
+    let mut authentication_ticket = String::new();
+    let mut join_script = String::new();
+    let mut client_version = String::new();
+    let mut client_year = String::new();
+    for (key, value) in parse_launch_arguments(payload) {
+        match key.as_str() {
+            "launchmode" => launch_mode = value,
+            "gameinfo" => authentication_ticket = value,
+            "placelauncherurl" => join_script = value,
+            "clientversion" => client_version = value,
+            "clientyear" => client_year = value,
+            _ => {}
+        }
+    }
+    if launch_mode != "play" {
+        return Err(format!("unknown launch mode '{}'", launch_mode));
+    }
+    if client_version.is_empty() {
+        client_version = version_from_legacy_year(&client_year)
+            .ok_or_else(|| "the Play link did not specify a supported client version".to_string())?
+            .to_string();
+    }
+    if !is_valid_version(&client_version) {
+        return Err("the Play link contains an invalid client version".to_string());
+    }
+    if authentication_ticket.is_empty() || join_script.is_empty() {
+        return Err("the Play link was incomplete. Press Play on the website again.".to_string());
+    }
+    let url = reqwest::Url::parse(&join_script)
+        .map_err(|_| "the Play link has an invalid join URL".to_string())?;
+    let expected_domain = base_url.trim_start_matches("www.");
+    let host = url.host_str().unwrap_or("").trim_start_matches("www.");
+    if url.scheme() != "https" || host != expected_domain || !url.path().eq_ignore_ascii_case("/Game/PlaceLauncher.ashx") {
+        return Err("the Play link points outside Seashell's game join endpoint".to_string());
+    }
+    Ok(LaunchRequest { client_version, authentication_ticket, join_script })
+}
+
 async fn run() -> LauncherResult<()> {
     let args: Vec<String> = std::env::args().collect();
-    let base_url : &str = option_env!("SEASHELL_DOMAIN").unwrap_or("www.seashell.rocks");
-    let setup_url : &str = option_env!("SEASHELL_SETUP_HOST").unwrap_or("www.seashell.rocks/client-downloads");
+    let base_url : &str = option_env!("SEASHELL_DOMAIN").unwrap_or("seashell.rocks");
+    let manifest_url: &str = option_env!("SEASHELL_CLIENT_MANIFEST_URL")
+        .unwrap_or("https://seashell.rocks/client-downloads/manifest-v2.json");
     #[cfg(target_os = "windows")]
-    let bootstrapper_filename = "SeashellPlayerLauncher.exe";
+    let bootstrapper_filename = format!("SeashellPlayerLauncher-{}.exe", env!("CARGO_PKG_VERSION"));
     #[cfg(not(target_os = "windows"))]
-    let bootstrapper_filename = "SyntaxPlayerLinuxLauncher";
+    let bootstrapper_filename = format!("SeashellPlayerLauncher-{}", env!("CARGO_PKG_VERSION"));
     print_banner(base_url);
 
     let http_client : Client = reqwest::Client::builder()
         .no_gzip()
+        // Every signed manifest URL names the exact first-party artifact. A redirect
+        // could silently fetch bytes from a different host, so require direct HTTPS.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("could not start the HTTP client: {}", e))?;
-    debug(&format!("Setup Server: {} | Base Server: {}", setup_url.bright_blue(), base_url.bright_blue()));
-
-    let latest_client_version = fetch_latest_version(&http_client, setup_url).await?;
-    info(&format!("Latest Client Version: {}", latest_client_version.cyan().underline()));
-
     let installation_directory = get_installation_directory()?;
-    let versions_directory = installation_directory.join("Versions");
-    let temp_downloads_directory = installation_directory.join("Downloads");
-    let current_version_directory = versions_directory.join(&latest_client_version);
-    debug(&format!("Current Version Directory: {}", current_version_directory.display().to_string().bright_blue()));
-    create_folder_if_not_exists(&current_version_directory)?;
-
-    let latest_bootstrapper_path = current_version_directory.join(bootstrapper_filename);
-    let latest_bootstrapper_url = format!("https://{}/{}-{}", setup_url, latest_client_version, bootstrapper_filename);
+    let launcher_directory = installation_directory.join("Launcher");
+    create_folder_if_not_exists(&launcher_directory)?;
+    let installed_launcher_path = launcher_directory.join(bootstrapper_filename);
     let current_exe_path = std::env::current_exe().map_err(|e| format!("could not find the running launcher: {}", e))?;
-    // Outside the current version folder, hand over to that version's launcher (downloading it if needed).
-    if !current_exe_path.starts_with(&current_version_directory) {
-        if !latest_bootstrapper_path.exists() {
-            info("Downloading the latest bootstrapper");
-            download_file_verified(&http_client, &latest_bootstrapper_url, &latest_bootstrapper_path).await?;
+    if current_exe_path != installed_launcher_path && !installed_launcher_path.exists() {
+        std::fs::copy(&current_exe_path, &installed_launcher_path)
+            .map_err(|e| format!("could not install the launcher at {}: {}", installed_launcher_path.display(), e))?;
+    }
+
+    // Check the same HTTPS manifest used for client packages on each launch. The update is
+    // downloaded to a new versioned path and verified before it gets control or registration.
+    let manifest = match client_manifest::fetch_manifest(&http_client, manifest_url).await {
+        Ok(manifest) => Some(manifest),
+        Err(message) if args.len() == 1 => {
+            error(&format!("Could not check for updates: {}", message));
+            None
         }
-
-        // Only hand over when the copy actually differs; antivirus software dislikes a
-        // launcher that keeps re-running itself.
-        let latest_bootstrapper_hash = get_sha1_hash_of_file(&latest_bootstrapper_path)?;
-        let current_exe_hash = get_sha1_hash_of_file(&current_exe_path)?;
-        debug(&format!("Latest Bootstrapper Hash: {}", latest_bootstrapper_hash.bright_blue()));
-        debug(&format!("Current Bootstrapper Hash: {}", current_exe_hash.bright_blue()));
-
-        if latest_bootstrapper_hash != current_exe_hash {
-            info("Starting latest bootstrapper");
-            #[cfg(target_os = "windows")]
-            {
-                if let Err(e) = std::process::Command::new(&latest_bootstrapper_path).args(&args[1..]).spawn() {
-                    debug(&format!("Bootstrapper errored with error {}", e));
-                    info("Found bootstrapper was corrupted! Downloading...");
-                    download_file_verified(&http_client, &latest_bootstrapper_url, &latest_bootstrapper_path).await?;
-                    std::process::Command::new(&latest_bootstrapper_path)
-                        .args(&args[1..])
-                        .spawn()
-                        .map_err(|e| format!("could not start the updated launcher {}: {}", latest_bootstrapper_path.display(), e))?;
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                std::process::Command::new("chmod")
-                    .arg("+x")
-                    .arg(&latest_bootstrapper_path)
-                    .status()
-                    .map_err(|e| format!("could not make {} executable: {}", latest_bootstrapper_path.display(), e))?;
-                install_desktop_entry(&latest_bootstrapper_path)?;
-                info("Please launch Seashell from the website to continue with the update process.");
-                std::thread::sleep(std::time::Duration::from_secs(20));
-            }
+        Err(message) => return Err(message),
+    };
+    if let Some(manifest) = manifest.as_ref() {
+        if launcher_update::maybe_update(
+            &http_client, manifest.launcher.as_ref(), &launcher_directory, &args,
+        ).await? {
             return Ok(());
         }
     }
 
-    // AppSettings.xml is written after a complete install; without it the folder is new or damaged.
-    let app_settings_path = current_version_directory.join("AppSettings.xml");
-    if !app_settings_path.exists() {
-        install_client(
-            &http_client,
-            setup_url,
-            base_url,
-            &latest_client_version,
-            &versions_directory,
-            &current_version_directory,
-            &latest_bootstrapper_path,
-            &temp_downloads_directory,
-        ).await?;
-        #[cfg(not(target_os = "windows"))]
-        {
-            install_desktop_entry(&latest_bootstrapper_path)?;
-        }
-    }
-
-    // Repair the play-button protocol every run, even when client files already
-    // exist (registry cleaners and copied profiles can remove it independently).
+    // Register a stable, versioned copy; never point the browser at a temporary download path.
     #[cfg(target_os = "windows")]
     {
         info("Installing seashell-player scheme");
-        if let Err(e) = install_player_protocol(&latest_bootstrapper_path) {
+        if let Err(e) = install_player_protocol(&installed_launcher_path) {
             error(&format!("Could not register the seashell-player protocol: {}", e));
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    install_desktop_entry(&installed_launcher_path)?;
 
-    // Started without a Play link: the install is done, so just open the website.
+    // Opening the launcher directly only registers the protocol and opens Seashell.
     if args.len() == 1 {
         info("Seashell is installed. Opening the games page...");
         let games_url = format!("https://{}/games", base_url);
         #[cfg(target_os = "windows")]
         {
-            std::process::Command::new("cmd")
-                .args(["/c", "start", "", games_url.as_str()])
-                .spawn()
-                .map_err(|e| format!("could not open {}: {}", games_url, e))?;
+            open_games_page(&games_url)?;
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -525,55 +416,40 @@ async fn run() -> LauncherResult<()> {
         return Ok(());
     }
 
-    // Looks like "seashell-player://1+launchmode:play+gameinfo:TICKET+placelauncherurl:https://www.seashell.rocks/Game/placelauncher.ashx?placeId=660&t=TICKET+k:l+clientyear:2016"
-    debug(&format!("Arguments Passed: {}", args.join(" ").bright_blue()));
-    let launch_arguments = args[1]
-        .replace("seashell-player://", "")
-        .replace("syntax-player://", "");
-
-    let mut launch_mode = String::new();
-    let mut authentication_ticket = String::new();
-    let mut join_script = String::new();
-    let mut client_year = String::new();
-    for (key, value) in parse_launch_arguments(&launch_arguments) {
-        debug(&format!("{}: {}", key.bright_blue(), value.bright_blue()));
-        match key.as_str() {
-            "launchmode" => launch_mode = value,
-            "gameinfo" => authentication_ticket = value,
-            "placelauncherurl" => join_script = value,
-            "clientyear" => client_year = value,
-            _ => {}
-        }
-    }
-    debug(&format!("Client year: {}", client_year));
-
-    let client_executable_path = current_version_directory.join("Client2016").join("RobloxPlayerBeta.exe");
-    if !client_executable_path.exists() {
-        // Removing the marker makes the next launch download the client again.
-        let _ = std::fs::remove_file(&app_settings_path);
-        return Err("RobloxPlayerBeta.exe is missing (antivirus software may have removed it). Press Play again to redownload the client.".to_string());
-    }
-    if launch_mode != "play" {
-        return Err(format!("unknown launch mode '{}'", launch_mode));
-    }
-    if authentication_ticket.is_empty() || join_script.is_empty() {
-        return Err("the Play link was incomplete. Press Play on the website again.".to_string());
-    }
+    let launch = parse_launch_request(&args[1], base_url)?;
+    info(&format!("Selected {} client", launch.client_version));
+    let manifest = manifest.ok_or_else(|| "could not load the client manifest".to_string())?;
+    let package = manifest.package(&launch.client_version)?;
+    let client_executable_path = client_manifest::install_package(
+        &http_client,
+        package,
+        &launch.client_version,
+        &installation_directory.join("Clients"),
+        &installation_directory.join("Downloads"),
+        base_url,
+    ).await?;
 
     info("Launching Seashell");
     let authentication_url = format!("https://{}/Login/Negotiate.ashx", base_url);
     let client_arguments = [
         "--play",
         "--authenticationUrl", authentication_url.as_str(),
-        "--authenticationTicket", authentication_ticket.as_str(),
-        "--joinScriptUrl", join_script.as_str(),
+        "--authenticationTicket", launch.authentication_ticket.as_str(),
+        "--joinScriptUrl", launch.join_script.as_str(),
     ];
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new(&client_executable_path)
-            .args(client_arguments)
-            .spawn()
-            .map_err(|e| format!("could not start {}: {}", client_executable_path.display(), e))?;
+        if launch.client_version == "2020L" {
+            client_patch::spawn_verified_2020(&client_executable_path, &client_arguments)?;
+        } else {
+            let working_directory = client_executable_path.parent()
+                .ok_or_else(|| "client executable has no parent directory".to_string())?;
+            std::process::Command::new(&client_executable_path)
+                .args(client_arguments)
+                .current_dir(working_directory)
+                .spawn()
+                .map_err(|e| format!("could not start {}: {}", client_executable_path.display(), e))?;
+        }
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
     #[cfg(not(target_os = "windows"))]
@@ -613,11 +489,6 @@ async fn main() {
         let _ = std::io::stdin().read_line(&mut line);
     }));
 
-    // Clear the terminal before printing the startup text
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd").args(["/c", "cls"]).status();
-    }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = std::process::Command::new("clear").status();
@@ -684,5 +555,27 @@ mod tests {
         let pairs = parse_launch_arguments(raw);
         assert_eq!(value_of(&pairs, "k"), None);
         assert_eq!(value_of(&pairs, "gameinfo"), Some("TICKET"));
+    }
+
+    #[test]
+    fn accepts_live_multi_version_play_links() {
+        for version in ["2017L", "2018L", "2020L", "2021M"] {
+            let uri = format!("seashell-player:1+launchmode:play+clientversion:{}+gameinfo:TICKET+placelauncherurl:https://seashell.rocks/Game/PlaceLauncher.ashx?request=RequestGame&placeId=660&isTeleport=true+k:l+client", version);
+            let launch = parse_launch_request(&uri, "www.seashell.rocks").unwrap();
+            assert_eq!(launch.client_version, version);
+            assert_eq!(launch.authentication_ticket, "TICKET");
+        }
+    }
+
+    #[test]
+    fn maps_older_clientyear_links() {
+        let uri = "seashell-player://1+launchmode:play+gameinfo:TICKET+placelauncherurl:https://www.seashell.rocks/Game/PlaceLauncher.ashx?placeId=660+clientyear:2018";
+        assert_eq!(parse_launch_request(uri, "seashell.rocks").unwrap().client_version, "2018L");
+    }
+
+    #[test]
+    fn rejects_join_urls_outside_seashell() {
+        let uri = "seashell-player:1+launchmode:play+clientversion:2017L+gameinfo:TICKET+placelauncherurl:https://evil.example/Game/PlaceLauncher.ashx?placeId=660";
+        assert!(parse_launch_request(uri, "seashell.rocks").is_err());
     }
 }

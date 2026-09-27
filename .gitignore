@@ -1,1 +1,5 @@
 /target
+/.env
+/signing-keys/
+*.pfx
+*.p12
